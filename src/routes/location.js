@@ -1,6 +1,7 @@
 const express = require('express');
 const supabase = require('../services/supabaseClient');
 const { checkGeofences } = require('../services/geofencing');
+const { checkSpeed } = require('../services/speed');
 const { estimateEta } = require('../services/eta');
 
 const router = express.Router();
@@ -8,7 +9,10 @@ const router = express.Router();
 /**
  * POST /api/location
  * Called by the driver app every few seconds.
- * Body: { busId, routeId, lat, lon, speed }
+ * Body: { busId, routeId, lat, lon, speed }   (speed in metres per second)
+ *
+ * Updates the bus's live position, records the reading in the history table, checks
+ * the speed limit, and checks stop geofences.
  */
 router.post('/location', async (req, res) => {
   const { busId, routeId, lat, lon, speed } = req.body;
@@ -33,9 +37,28 @@ router.post('/location', async (req, res) => {
       return res.status(500).json({ error: `Failed to update bus position: ${updateError.message}` });
     }
 
+    // History + speed check are best-effort: if either fails (for example the database
+    // migration hasn't been run yet) we log it, but live tracking must keep working.
+    let speedInfo = null;
+    try {
+      const { error: positionError } = await supabase
+        .from('positions')
+        .insert({ bus_id: busId, lat, lon, speed: speed ?? 0 });
+
+      if (positionError) {
+        // eslint-disable-next-line no-console
+        console.error(`[positions] insert failed: ${positionError.message}`);
+      }
+
+      speedInfo = await checkSpeed({ busId, routeId, lat, lon, speedMps: speed ?? 0 });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[speed] check failed: ${err.message}`);
+    }
+
     const events = await checkGeofences({ busId, routeId, lat, lon });
 
-    return res.status(200).json({ ok: true, events });
+    return res.status(200).json({ ok: true, events, speed: speedInfo });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
